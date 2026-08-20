@@ -1,0 +1,6 @@
+ERROR Wed Aug 19 15:49:51 2026: could not create window
+
+WARNING Wed Aug 19 15:58:18 2026: Nan, Inf or huge value in QVEL at DOF 0. The simulation is unstable. Time = 0.0010.
+
+WARNING Wed Aug 19 15:58:18 2026: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.0000.
+

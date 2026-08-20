@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "g1-mujoco-sim"
+version = "0.1.0"
+description = "Standalone MuJoCo runner for the Unitree G1 29-DoF robot"
+requires-python = ">=3.10"
+dependencies = [
+    "mujoco>=3.2.0",
+    "numpy>=1.23",
+    "paho-mqtt>=2.0",
+]
+
+[project.optional-dependencies]
+bridge = ["far-unitree-sdk==0.1.4"]
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[project.scripts]
+g1-run-sim = "g1_mujoco_sim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["g1_mujoco_sim*"]
+
+[tool.setuptools.package-data]
+g1_mujoco_sim = ["assets/g1/*.xml", "assets/g1/meshes/*.STL"]
