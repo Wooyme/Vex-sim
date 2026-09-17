@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from importlib.resources import files
+import math
+import threading
 import time
 
 import numpy as np
@@ -11,6 +14,7 @@ import numpy as np
 from .bridge import UnitreeBridge
 from .config import DEFAULT_JOINT_POSITIONS, JOINT_NAMES, KD, KP, SimulationConfig
 from .gantry import VirtualGantry
+from .forces import ActiveForce, ForceCommand
 from .mqtt import MqttStatePublisher
 from .terrain import build_world
 
@@ -80,21 +84,64 @@ class G1Simulation:
         self.camera_tracking = False
         self.bridge = UnitreeBridge(self.model, self.data, config.bridge_interface) if config.bridge else None
         self.mqtt_publisher: MqttStatePublisher | None = None
-        self._mqtt_period = 1.0 / config.mqtt.frequency if config.mqtt is not None else None
+        self._mqtt_period = (
+            1.0 / config.mqtt.frequency
+            if config.mqtt is not None and config.mqtt.frequency is not None else None
+        )
         self._next_mqtt_publish: float | None = None
+        self._state_lock = threading.RLock()
+        self._force_queue: deque[tuple[ForceCommand, ...]] = deque()
+        self._active_forces: list[ActiveForce] = []
         self.reset()
 
     def reset(self) -> None:
-        self.mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[self.qpos_ids] = self.targets
-        # The first joint is the floating base in the bundled model.
-        self.data.qpos[self.free_qpos : self.free_qpos + 3] = (0.0, 0.0, 0.82)
-        self.data.qpos[self.free_qpos + 3 : self.free_qpos + 7] = (1.0, 0.0, 0.0, 0.0)
-        self.mujoco.mj_forward(self.model, self.data)
-        self.virtual_gantry.set_position_to_robot(self.data.xpos[self.root_body_id])
+        with self._state_lock:
+            self._force_queue.clear()
+            self._active_forces.clear()
+            self.mujoco.mj_resetData(self.model, self.data)
+            self.data.qpos[self.qpos_ids] = self.targets
+            # The first joint is the floating base in the bundled model.
+            self.data.qpos[self.free_qpos : self.free_qpos + 3] = (0.0, 0.0, 0.82)
+            self.data.qpos[self.free_qpos + 3 : self.free_qpos + 7] = (1.0, 0.0, 0.0, 0.0)
+            self.mujoco.mj_forward(self.model, self.data)
+            self.virtual_gantry.set_position_to_robot(self.data.xpos[self.root_body_id])
+
+    def _enqueue_forces(self, commands: tuple[ForceCommand, ...]) -> None:
+        """Called by the MQTT thread; only the simulation thread applies forces."""
+        with self._state_lock:
+            self._force_queue.append(commands)
+
+    def _apply_forces(self) -> None:
+        """Rebuild world-frame forces at body centers of mass before each step."""
+        now = float(self.data.time)
+        self._active_forces = [
+            force for force in self._active_forces
+            if now < force.end_time
+            and not math.isclose(now, force.end_time, rel_tol=0.0, abs_tol=1e-12)
+        ]
+        while self._force_queue:
+            commands = self._force_queue.popleft()
+            batch = []
+            for command in commands:
+                body_id = self.mujoco.mj_name2id(
+                    self.model, self.mujoco.mjtObj.mjOBJ_BODY, command.body_name,
+                )
+                if body_id <= 0:
+                    LOG.warning("Ignoring MQTT force batch: invalid body_name %r", command.body_name)
+                    break
+                end_time = now + command.duration
+                if not math.isfinite(end_time):
+                    LOG.warning("Ignoring MQTT force batch: duration overflows simulation time")
+                    break
+                batch.append(ActiveForce(body_id, command.force, end_time))
+            else:
+                self._active_forces.extend(batch)
+        self.data.xfrc_applied[:] = 0.0
+        self._apply_gantry()
+        for force in self._active_forces:
+            self.data.xfrc_applied[force.body_id, :3] += force.force
 
     def _apply_gantry(self) -> None:
-        self.data.xfrc_applied[self.gantry_body_id] = 0.0
         if not self.virtual_gantry.enabled:
             return
         # Holosoma computes the band from the floating root state, then applies
@@ -102,7 +149,7 @@ class G1Simulation:
         position = self.data.xpos[self.root_body_id]
         # cvel stores angular then linear velocity for a body.
         velocity = self.data.cvel[self.root_body_id, 3:6]
-        self.data.xfrc_applied[self.gantry_body_id, :3] = self.virtual_gantry.advance(position, velocity)
+        self.data.xfrc_applied[self.gantry_body_id, :3] += self.virtual_gantry.advance(position, velocity)
 
     def _control(self) -> None:
         if self.bridge is not None:
@@ -118,7 +165,7 @@ class G1Simulation:
     def run(self) -> None:
         try:
             if self.config.mqtt is not None:
-                self.mqtt_publisher = MqttStatePublisher(self.config.mqtt)
+                self.mqtt_publisher = MqttStatePublisher(self.config.mqtt, on_forces=self._enqueue_forces)
                 self._next_mqtt_publish = time.perf_counter()
             if self.config.headless:
                 self._run_loop(None)
@@ -253,11 +300,12 @@ class G1Simulation:
         while self.config.steps <= 0 or step < self.config.steps:
             if viewer is not None and not viewer.is_running():
                 break
-            self._control()
-            self._apply_gantry()
-            self.mujoco.mj_step(self.model, self.data)
+            with self._state_lock:
+                self._control()
+                self._apply_forces()
+                self.mujoco.mj_step(self.model, self.data)
+                self._maybe_publish_mqtt()
             step += 1
-            self._maybe_publish_mqtt()
             if viewer is not None and step % sync_interval == 0:
                 if self.camera_tracking:
                     viewer.cam.lookat[:] = self.data.xpos[self.root_body_id]

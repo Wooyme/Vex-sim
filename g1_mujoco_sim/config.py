@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 
@@ -61,21 +62,30 @@ class TerrainConfig:
 
 @dataclass(frozen=True)
 class MqttConfig:
-    """MQTT destination and wall-clock publishing frequency."""
+    """Shared MQTT broker, optional state publishing and force subscription."""
 
     broker: str
-    topic: str
-    frequency: float
+    topic: str | None = None
+    frequency: float | None = None
+    force_topic: str | None = None
 
     def __post_init__(self) -> None:
         if not self.broker.strip():
             raise ValueError("MQTT broker must not be empty")
-        if not self.topic.strip():
-            raise ValueError("MQTT topic must not be empty")
-        if "+" in self.topic or "#" in self.topic:
-            raise ValueError("MQTT publish topic cannot contain wildcards (+ or #)")
-        if self.frequency <= 0:
-            raise ValueError("MQTT frequency must be positive")
+        if (self.topic is None) != (self.frequency is None):
+            raise ValueError("--mqtt-topic and --mqtt-frequency must be provided together")
+        if self.topic is None and self.force_topic is None:
+            raise ValueError("MQTT requires a state topic or a force topic")
+        for topic in (self.topic, self.force_topic):
+            if topic is not None:
+                if not topic.strip() or "\x00" in topic:
+                    raise ValueError("MQTT topic must not be empty or contain NUL")
+                if "+" in topic or "#" in topic:
+                    raise ValueError("MQTT topics cannot contain wildcards (+ or #)")
+        if self.force_topic is not None and self.force_topic == self.topic:
+            raise ValueError("MQTT state and force topics must differ")
+        if self.frequency is not None and (not math.isfinite(self.frequency) or self.frequency <= 0):
+            raise ValueError("MQTT frequency must be finite and positive")
 
 
 @dataclass(frozen=True)

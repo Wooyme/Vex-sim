@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mqtt-topic", help="MQTT topic used to publish robot state")
     parser.add_argument("--mqtt-frequency", type=float, help="MQTT wall-clock publish rate in Hz")
+    parser.add_argument("--mqtt-force-topic", help="MQTT topic used to receive timed world-frame forces")
     return parser
 
 
@@ -84,13 +85,15 @@ def main(argv: list[str] | None = None) -> None:
             terrain_kind = "mesh"
         if args.fps <= 0 or args.viewer_fps <= 0 or args.steps < 0:
             raise ValueError("fps/viewer-fps must be positive and steps must be non-negative")
-        mqtt_values = (args.mqtt_broker, args.mqtt_topic, args.mqtt_frequency)
-        if any(value is not None for value in mqtt_values) and not all(value is not None for value in mqtt_values):
-            raise ValueError("--mqtt-broker, --mqtt-topic and --mqtt-frequency must be provided together")
+        mqtt_values = (args.mqtt_topic, args.mqtt_frequency, args.mqtt_force_topic)
+        if any(value is not None for value in mqtt_values) and args.mqtt_broker is None:
+            raise ValueError("--mqtt-broker is required for MQTT publishing or subscription")
         mqtt_config = None
         if args.mqtt_broker is not None:
-            mqtt_config = MqttConfig(args.mqtt_broker, args.mqtt_topic, args.mqtt_frequency)
-            if mqtt_config.frequency > args.fps:
+            mqtt_config = MqttConfig(
+                args.mqtt_broker, args.mqtt_topic, args.mqtt_frequency, args.mqtt_force_topic,
+            )
+            if mqtt_config.frequency is not None and mqtt_config.frequency > args.fps:
                 raise ValueError("MQTT frequency cannot exceed simulation FPS")
         config = SimulationConfig(
             terrain=TerrainConfig(

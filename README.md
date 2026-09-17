@@ -74,14 +74,58 @@ broker 支持 `host[:port]`、`mqtt://user:password@host:port` 和启用 TLS 的
   "timestamp": 1750000000.123,
   "simulation_time": 1.25,
   "joint_names": ["left_hip_pitch_joint"],
-  "joint_angles": [-0.312],
+  "joint_values": [-0.312],
   "base_xyz": [0.0, 0.0, 0.82],
   "base_quat_wxyz": [1.0, 0.0, 0.0, 0.0]
 }
 ```
 
-实际消息中的 `joint_names` 和 `joint_angles` 均包含全部 29 个关节；四元数保持
-MuJoCo 的 `[w, x, y, z]` 顺序。三个 MQTT 参数必须同时提供，且发布频率不能高于仿真 FPS。
+实际消息中的 `joint_names` 和 `joint_values` 均包含全部 29 个关节；四元数保持
+MuJoCo 的 `[w, x, y, z]` 顺序。状态发布需要同时提供上述三个 MQTT 参数，且发布频率不能高于仿真 FPS。
+
+## MQTT 外力订阅
+
+使用 `--mqtt-force-topic` 订阅施力指令，可以单独启用，也可以与状态发布共用同一 broker 和连接：
+
+```bash
+uv run g1-run-sim \
+  --mqtt-broker mqtt://localhost:1883 \
+  --mqtt-force-topic robot/g1/mujoco/force
+```
+
+需要同时发布状态时，追加 `--mqtt-topic robot/g1/mujoco/state --mqtt-frequency 50`。
+两个主题必须不同，均不支持通配符。订阅使用 QoS 0，连接及重连后自动订阅；订阅启动失败会报错退出。
+
+消息为 JSON 对象，`forces` 数组中可包含一个或多个力。单力示例（需要安装 `mosquitto_pub`）：
+
+```bash
+mosquitto_pub -h localhost -t robot/g1/mujoco/force -m \
+  '{"forces":[{"body_name":"torso_link","direction":[1,0,0],"magnitude":50,"duration":0.5}]}'
+```
+
+多力示例：
+
+```bash
+mosquitto_pub -h localhost -t robot/g1/mujoco/force -m \
+  '{"forces":[{"body_name":"torso_link","direction":[1,0,0],"magnitude":50,"duration":0.5},{"body_name":"pelvis","direction":[0,1,0],"magnitude":20,"duration":1.0}]}'
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `body_name` | 模型中的 body 名称，例如 `torso_link`、`pelvis`，不允许 world body |
+| `direction` | 世界坐标系中的三维非零方向向量，自动归一化，不随 body 姿态旋转 |
+| `magnitude` | 力的大小，单位 N，须为非负有限数值 |
+| `duration` | 持续的仿真秒数，须为正的有限数值 |
+
+力作用于对应 body 的质心，不附加力矩。同一消息的力在仿真主循环消费该消息时同时开始，
+每个力独立计时；同一 body 上来自同批或不同消息的力，以及虚拟吊架力，均按向量相加。
+计时使用仿真时间，不使用现实时间，因此 `--no-realtime` 不改变施力的仿真时长。
+持续时间以仿真步长为精度，向上取整到完整步，短于一步的正持续时间仍施加一步。
+
+非法消息（包括空数组、错误字段、非有限数值、未知 body）整批丢弃并记录原因，已有力不受影响。
+Backspace 重置会清除待执行及有效力。断线后已生效的力继续至到期；重连不会重放历史命令。
+请使用非 retained 发布（不要添加 `mosquitto_pub -r`）；订阅端忽略带 retained 标志的历史消息。
+QoS 0 不保证送达，每条实际收到的有效消息都作为一批新的力执行。
 
 ## Unitree bridge
 

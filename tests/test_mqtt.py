@@ -28,7 +28,7 @@ def test_state_json_has_documented_mujoco_quaternion_order():
         timestamp=123.5,
         simulation_time=1.25,
         joint_names=("a", "b"),
-        joint_angles=np.array([0.1, -0.2]),
+        joint_values=np.array([0.1, -0.2]),
         base_xyz=np.array([1.0, 2.0, 3.0]),
         base_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
     )
@@ -37,7 +37,7 @@ def test_state_json_has_documented_mujoco_quaternion_order():
         "timestamp": 123.5,
         "simulation_time": 1.25,
         "joint_names": ["a", "b"],
-        "joint_angles": [0.1, -0.2],
+        "joint_values": [0.1, -0.2],
         "base_xyz": [1.0, 2.0, 3.0],
         "base_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
     }
@@ -69,7 +69,7 @@ def test_wall_clock_scheduler_and_simulation_state():
     assert sim._maybe_publish_mqtt(10.11)
     assert len(publisher.samples) == 2
     sample = publisher.samples[0]
-    assert len(sample["joint_names"]) == len(sample["joint_angles"]) == 29
+    assert len(sample["joint_names"]) == len(sample["joint_values"]) == 29
     assert sample["base_xyz"].shape == (3,)
     assert sample["base_quat_wxyz"].shape == (4,)
 

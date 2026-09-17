@@ -4,3 +4,5 @@ WARNING Wed Aug 19 15:58:18 2026: Nan, Inf or huge value in QVEL at DOF 0. The s
 
 WARNING Wed Aug 19 15:58:18 2026: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.0000.
 
+WARNING Mon Aug 24 13:31:56 2026: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 5240.7960.
+

@@ -1,4 +1,4 @@
-"""MQTT transport for publishing MuJoCo robot state."""
+"""MQTT transport for state publishing and timed force commands."""
 
 from __future__ import annotations
 
@@ -8,13 +8,14 @@ import logging
 import os
 import threading
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 from urllib.parse import unquote, urlsplit
 
 import numpy as np
 import numpy.typing as npt
 
 from .config import MqttConfig
+from .forces import ForceCommand, decode_forces
 
 LOG = logging.getLogger(__name__)
 
@@ -77,9 +78,12 @@ def encode_state(
 
 
 class MqttStatePublisher:
-    """Asynchronous paho-mqtt publisher with bounded startup waiting."""
+    """Shared asynchronous MQTT connection with bounded startup waiting."""
 
-    def __init__(self, config: MqttConfig, connect_timeout: float = 5.0):
+    def __init__(
+        self, config: MqttConfig, connect_timeout: float = 5.0,
+        *, on_forces: Callable[[tuple[ForceCommand, ...]], None] | None = None,
+    ):
         try:
             import paho.mqtt.client as mqtt
         except ImportError as exc:
@@ -88,43 +92,91 @@ class MqttStatePublisher:
         endpoint = parse_broker(config.broker)
         self._mqtt = mqtt
         self._topic = config.topic
+        self._force_topic = config.force_topic
+        self._on_forces = on_forces
+        if self._force_topic is not None and on_forces is None:
+            raise ValueError("A force subscription requires an on_forces callback")
         self._connected = threading.Event()
+        self._startup_done = threading.Event()
         self._connect_error: str | None = None
+        self._subscription_mid: int | None = None
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=f"g1-mujoco-sim-{os.getpid()}",
+            clean_session=True,
         )
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        self._client.on_subscribe = self._on_subscribe
+        self._client.on_message = self._on_message
         if endpoint.username is not None:
             self._client.username_pw_set(endpoint.username, endpoint.password)
         if endpoint.tls:
             self._client.tls_set()
 
-        LOG.info("Connecting MQTT publisher to %s:%d", endpoint.host, endpoint.port)
-        self._client.connect_async(endpoint.host, endpoint.port, keepalive=30)
-        self._client.loop_start()
-        if not self._connected.wait(connect_timeout):
+        LOG.info("Connecting MQTT client to %s:%d", endpoint.host, endpoint.port)
+        try:
+            self._client.connect_async(endpoint.host, endpoint.port, keepalive=30)
+            self._client.loop_start()
+            ready = self._startup_done.wait(connect_timeout)
+            if not ready or not self._connected.is_set():
+                detail = self._connect_error or "connection/subscription timed out"
+                raise RuntimeError(f"MQTT startup failed at {endpoint.host}:{endpoint.port}: {detail}")
+        except BaseException:
             self.close()
-            detail = f": {self._connect_error}" if self._connect_error else ""
-            raise RuntimeError(
-                f"Timed out connecting to MQTT broker {endpoint.host}:{endpoint.port}{detail}"
-            )
+            raise
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
-        del client, userdata, flags, properties
+        del userdata, flags, properties
+        self._connected.clear()
+        self._subscription_mid = None
         if reason_code == 0:
-            self._connected.set()
-            LOG.info("MQTT publisher connected; topic=%s", self._topic)
+            self._connect_error = None
+            LOG.info("MQTT connected; state=%s, forces=%s", self._topic, self._force_topic)
+            if self._force_topic is not None:
+                result, self._subscription_mid = client.subscribe(self._force_topic, qos=0)
+                if result != self._mqtt.MQTT_ERR_SUCCESS:
+                    self._fail_startup(f"force subscription failed: {self._mqtt.error_string(result)}")
+            else:
+                self._connected.set()
+                self._startup_done.set()
         else:
-            self._connect_error = str(reason_code)
-            LOG.error("MQTT connection rejected: %s", reason_code)
+            self._fail_startup(f"connection rejected: {reason_code}")
+
+    def _fail_startup(self, reason: str) -> None:
+        self._connect_error = reason
+        self._connected.clear()
+        self._startup_done.set()
+        LOG.error("MQTT %s", reason)
+
+    def _on_subscribe(self, client, userdata, mid, reason_codes, properties) -> None:
+        del client, userdata, properties
+        if mid != self._subscription_mid:
+            return
+        if not reason_codes or any(code.is_failure for code in reason_codes):
+            self._fail_startup(f"force subscription rejected: {reason_codes}")
+            return
+        self._connected.set()
+        self._startup_done.set()
+        LOG.info("MQTT subscribed to force topic %s", self._force_topic)
+
+    def _on_message(self, client, userdata, message) -> None:
+        del client, userdata
+        if message.topic != self._force_topic or message.retain:
+            return
+        try:
+            commands = decode_forces(message.payload)
+        except ValueError as exc:
+            LOG.warning("Ignoring invalid MQTT force batch: %s", exc)
+            return
+        if self._on_forces is not None:
+            self._on_forces(commands)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
         del client, userdata, disconnect_flags, properties
         self._connected.clear()
         if reason_code != 0:
-            LOG.warning("MQTT publisher disconnected unexpectedly: %s", reason_code)
+            LOG.warning("MQTT disconnected unexpectedly: %s", reason_code)
 
     def publish_state(
         self,
@@ -135,6 +187,8 @@ class MqttStatePublisher:
         base_xyz: npt.ArrayLike,
         base_quat_wxyz: npt.ArrayLike,
     ) -> None:
+        if self._topic is None:
+            return
         payload = encode_state(
             simulation_time=simulation_time,
             joint_names=joint_names,
