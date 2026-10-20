@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 
+from .points import PointControllerCfg
+
 
 JOINT_NAMES = (
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
@@ -109,3 +111,4 @@ class SimulationConfig:
     bridge: bool = False
     bridge_interface: str | None = None
     mqtt: MqttConfig | None = None
+    point_controller: PointControllerCfg = PointControllerCfg()

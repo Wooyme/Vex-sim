@@ -1,4 +1,4 @@
-"""MQTT transport for state publishing and timed force commands."""
+"""MQTT transport for state publishing and timed force and point commands."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .config import MqttConfig
-from .forces import ForceCommand, decode_forces
+from .forces import ForceCommand, PointCommand, decode_commands
 
 LOG = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class MqttStatePublisher:
 
     def __init__(
         self, config: MqttConfig, connect_timeout: float = 5.0,
-        *, on_forces: Callable[[tuple[ForceCommand, ...]], None] | None = None,
+        *, on_forces: Callable[[tuple[ForceCommand | PointCommand, ...]], None] | None = None,
     ):
         try:
             import paho.mqtt.client as mqtt
@@ -165,7 +165,7 @@ class MqttStatePublisher:
         if message.topic != self._force_topic or message.retain:
             return
         try:
-            commands = decode_forces(message.payload)
+            commands = decode_commands(message.payload)
         except ValueError as exc:
             LOG.warning("Ignoring invalid MQTT force batch: %s", exc)
             return

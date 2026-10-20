@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from importlib.resources import files
 import math
 import threading
@@ -14,11 +15,21 @@ import numpy as np
 from .bridge import UnitreeBridge
 from .config import DEFAULT_JOINT_POSITIONS, JOINT_NAMES, KD, KP, SimulationConfig
 from .gantry import VirtualGantry
-from .forces import ActiveForce, ForceCommand
+from .forces import ActiveForce, ForceCommand, PointCommand
 from .mqtt import MqttStatePublisher
+from .points import PointController
 from .terrain import build_world
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass
+class ActivePoint:
+    body_id: int
+    height: float
+    velocity: np.ndarray
+    end_time: float
+    controller: PointController
 
 
 class G1Simulation:
@@ -90,14 +101,16 @@ class G1Simulation:
         )
         self._next_mqtt_publish: float | None = None
         self._state_lock = threading.RLock()
-        self._force_queue: deque[tuple[ForceCommand, ...]] = deque()
+        self._force_queue: deque[tuple[ForceCommand | PointCommand, ...]] = deque()
         self._active_forces: list[ActiveForce] = []
+        self._active_points: list[ActivePoint] = []
         self.reset()
 
     def reset(self) -> None:
         with self._state_lock:
             self._force_queue.clear()
             self._active_forces.clear()
+            self._active_points.clear()
             self.mujoco.mj_resetData(self.model, self.data)
             self.data.qpos[self.qpos_ids] = self.targets
             # The first joint is the floating base in the bundled model.
@@ -106,7 +119,7 @@ class G1Simulation:
             self.mujoco.mj_forward(self.model, self.data)
             self.virtual_gantry.set_position_to_robot(self.data.xpos[self.root_body_id])
 
-    def _enqueue_forces(self, commands: tuple[ForceCommand, ...]) -> None:
+    def _enqueue_forces(self, commands: tuple[ForceCommand | PointCommand, ...]) -> None:
         """Called by the MQTT thread; only the simulation thread applies forces."""
         with self._state_lock:
             self._force_queue.append(commands)
@@ -114,32 +127,65 @@ class G1Simulation:
     def _apply_forces(self) -> None:
         """Rebuild world-frame forces at body centers of mass before each step."""
         now = float(self.data.time)
-        self._active_forces = [
-            force for force in self._active_forces
-            if now < force.end_time
-            and not math.isclose(now, force.end_time, rel_tol=0.0, abs_tol=1e-12)
-        ]
+
+        def active(end_time: float) -> bool:
+            return now < end_time and not math.isclose(now, end_time, rel_tol=0.0, abs_tol=1e-12)
+
+        self._active_forces = [force for force in self._active_forces if active(force.end_time)]
+        self._active_points = [point for point in self._active_points if active(point.end_time)]
         while self._force_queue:
-            commands = self._force_queue.popleft()
-            batch = []
-            for command in commands:
-                body_id = self.mujoco.mj_name2id(
-                    self.model, self.mujoco.mjtObj.mjOBJ_BODY, command.body_name,
-                )
-                if body_id <= 0:
-                    LOG.warning("Ignoring MQTT force batch: invalid body_name %r", command.body_name)
-                    break
-                end_time = now + command.duration
-                if not math.isfinite(end_time):
-                    LOG.warning("Ignoring MQTT force batch: duration overflows simulation time")
-                    break
-                batch.append(ActiveForce(body_id, command.force, end_time))
-            else:
-                self._active_forces.extend(batch)
+            self._start_batch(self._force_queue.popleft(), now)
         self.data.xfrc_applied[:] = 0.0
         self._apply_gantry()
         for force in self._active_forces:
             self.data.xfrc_applied[force.body_id, :3] += force.force
+        for point in self._active_points:
+            position, velocity = self._com_state(point.body_id)
+            self.data.xfrc_applied[point.body_id, :3] += point.controller.compute(
+                requested_height_w=point.height,
+                requested_velocity_xy_w=point.velocity,
+                point_position_w=position,
+                point_velocity_w=velocity,
+            )
+
+    def _start_batch(self, commands: tuple[ForceCommand | PointCommand, ...], now: float) -> None:
+        """Validate a whole batch against the model before starting any of it."""
+        resolved = []
+        for command in commands:
+            body_id = self.mujoco.mj_name2id(
+                self.model, self.mujoco.mjtObj.mjOBJ_BODY, command.body_name,
+            )
+            if body_id <= 0:
+                LOG.warning("Ignoring MQTT force batch: invalid body_name %r", command.body_name)
+                return
+            end_time = now + command.duration
+            if not math.isfinite(end_time):
+                LOG.warning("Ignoring MQTT force batch: duration overflows simulation time")
+                return
+            resolved.append((command, body_id, end_time))
+        for command, body_id, end_time in resolved:
+            if isinstance(command, ForceCommand):
+                self._active_forces.append(ActiveForce(body_id, command.force, end_time))
+                continue
+            velocity = np.asarray(command.velocity, dtype=np.float64)
+            # A point command for an already controlled body retargets it and
+            # keeps its controller state, so commands can be streamed.
+            for point in self._active_points:
+                if point.body_id == body_id:
+                    point.height, point.velocity, point.end_time = command.height, velocity, end_time
+                    break
+            else:
+                controller = PointController(self.config.point_controller, dt=float(self.model.opt.timestep))
+                position, com_velocity = self._com_state(body_id)
+                controller.reset(point_position_w=position, point_velocity_w=com_velocity)
+                self._active_points.append(ActivePoint(body_id, command.height, velocity, end_time, controller))
+
+    def _com_state(self, body_id: int) -> tuple[np.ndarray, np.ndarray]:
+        """World position and linear velocity of a body's center of mass."""
+        twist = np.zeros(6)
+        # For mjOBJ_BODY this is the world-oriented (angular, linear) velocity at xipos.
+        self.mujoco.mj_objectVelocity(self.model, self.data, self.mujoco.mjtObj.mjOBJ_BODY, body_id, twist, 0)
+        return self.data.xipos[body_id].copy(), twist[3:]
 
     def _apply_gantry(self) -> None:
         if not self.virtual_gantry.enabled:

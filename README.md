@@ -127,6 +127,29 @@ Backspace 重置会清除待执行及有效力。断线后已生效的力继续�
 请使用非 retained 发布（不要添加 `mosquitto_pub -r`）；订阅端忽略带 retained 标志的历史消息。
 QoS 0 不保证送达，每条实际收到的有效消息都作为一批新的力执行。
 
+### 点控制器（points）
+
+同一主题的消息还可以包含 `points` 数组（可与 `forces` 同时出现，整条消息一起校验、一起生效）。
+每个 point 在其持续时间内每个仿真步运行一次从 holosoma 移植的 `PointController`：
+高度 PD 加水平速度 PID，按测得的 body 质心位置和速度计算世界坐标系下的力，并作用于该 body 质心：
+
+```bash
+mosquitto_pub -h localhost -t robot/g1/mujoco/force -m \
+  '{"points":[{"body_name":"pelvis","height":0.8,"velocity":[0.3,0],"duration":2.0}]}'
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `body_name` | 同 `forces`，不允许 world body |
+| `height` | 质心目标高度（世界坐标 z），单位 m |
+| `velocity` | 质心目标水平速度 `[vx, vy]`（世界坐标），单位 m/s |
+| `duration` | 持续的仿真秒数，须为正的有限数值 |
+
+控制器在开始时用测得的高度和速度初始化参考值，再以限速（高度 0.2 m/s，速度 2 m/s²）趋近目标；
+不做重力补偿，竖直力上限 300 N，水平力上限 100 N（默认增益见 `g1_mujoco_sim/points.py` 的
+`PointControllerCfg`）。对同一 body 已在生效的 point 再次下发指令时，只更新目标和到期时间、
+保留控制器状态，因此可以连续流式发送指令；point 力与 `forces`、吊架力按向量相加。
+
 ## Unitree bridge
 
 安装 bridge extra 后，可用 `--bridge` 开启 G1 LowState/LowCmd DDS 桥：
